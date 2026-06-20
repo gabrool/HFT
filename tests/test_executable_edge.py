@@ -1,7 +1,14 @@
+from dataclasses import fields
+from pathlib import Path
+
 import pytest
 
 from mmrt.execution.contracts import LinearSignal, OrderSide
-from mmrt.execution.executable_edge import compute_side_executable_edge
+from mmrt.execution.executable_edge import (
+    ExecutableEdgeConfig,
+    SideExecutableEdge,
+    compute_side_executable_edge,
+)
 
 
 def _signal(ret=2.0):
@@ -33,10 +40,10 @@ def test_executable_edge_bid_ask_alpha_and_costs():
     assert ask.alpha_bps == pytest.approx(-2.0)
     assert bid.maker_rebate_bps > 0.0
     assert bid.adverse_cost_bps_uncond == pytest.approx(1.0)
+    assert not hasattr(bid, "adverse_cost_bps_cond")
+    assert not hasattr(bid, "edge_cond_fill_bps")
     with pytest.raises(ValueError):
         compute_side_executable_edge(candidate_name="away_1", side=OrderSide.BUY, mid_tick=100.0, price_tick=99, linear_signal=_signal(), adverse_predictions=preds)
-
-from pathlib import Path
 
 
 def test_executable_edge_spread_capture_is_signed():
@@ -60,3 +67,35 @@ def test_executable_edge_does_not_floor_spread_capture():
     source = Path("mmrt/execution/executable_edge.py").read_text(encoding="utf-8")
     assert "max(mid_tick - price_tick, 0.0)" not in source
     assert "max(price_tick - mid_tick, 0.0)" not in source
+
+
+def test_executable_edge_removed_conditional_fill_fields_are_absent():
+    config_fields = {field.name for field in fields(ExecutableEdgeConfig)}
+    edge_fields = {field.name for field in fields(SideExecutableEdge)}
+
+    assert "probability_epsilon" not in config_fields
+    assert "adverse_cost_bps_cond" not in edge_fields
+    assert "edge_cond_fill_bps" not in edge_fields
+
+
+def test_executable_edge_zero_fill_probability_keeps_attempt_edge_only():
+    preds = {
+        "bid_touch_filled": 0.0,
+        "bid_touch_toxic_cost_bps": 1.25,
+    }
+
+    edge = compute_side_executable_edge(
+        candidate_name="touch",
+        side=OrderSide.BUY,
+        mid_tick=100.0,
+        price_tick=99,
+        linear_signal=_signal(2.0),
+        adverse_predictions=preds,
+        config=ExecutableEdgeConfig(latency_buffer_bps=0.75, inventory_skew_bps_per_unit=0.5),
+        inventory_qty=2.0,
+    )
+
+    assert edge.fill_prob == pytest.approx(0.0)
+    assert edge.edge_attempt_bps == pytest.approx(-1.25 - 0.75 - 1.0)
+    assert not edge.quote_allowed
+    assert not hasattr(edge, "edge_cond_fill_bps")

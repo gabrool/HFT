@@ -87,6 +87,7 @@ def test_parser_default_env_config_is_colocated_balanced():
     assert env_config.cancel_guard_ticks == DEFAULT_CANCEL_GUARD_TICKS
     assert env_config.action_spec.max_distance_ticks == DEFAULT_MAX_DISTANCE_TICKS
     assert env_config.action_spec.max_order_qty == DEFAULT_MAX_ORDER_QTY
+    assert env_config.observation_builder_config.inventory_qty_reference == DEFAULT_MAX_ORDER_QTY
     assert env_config.quote_geometry_config.default_order_qty == DEFAULT_DEFAULT_ORDER_QTY
     assert env_config.quote_geometry_config.post_only_gap_ticks == DEFAULT_POST_ONLY_GAP_TICKS
     assert queue.mode == QueueModelMode.BALANCED

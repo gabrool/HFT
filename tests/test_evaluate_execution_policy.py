@@ -612,6 +612,39 @@ def test_evaluate_execution_policy_rejects_policy_state_schema_dimension_mismatc
         )
 
 
+def test_evaluate_execution_policy_rejects_removed_checkpoint_observation_fields(tmp_path):
+    tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+    cases = (
+        ("inventory_notional_bps", "inventory_notional_bps was removed"),
+        ("edge_bid_touch_cond_fill_bps", "conditional-fill edge is numerically unstable"),
+    )
+    for field_name, match in cases:
+        bad_checkpoint = dict(checkpoint)
+        bad_checkpoint["observation_schema"] = dict(checkpoint["observation_schema"])
+        bad_checkpoint["observation_schema"]["field_names"] = [
+            *checkpoint["observation_schema"]["field_names"],
+            field_name,
+        ]
+        bad_path = tmp_path / f"removed_{field_name}.pt"
+        torch.save(bad_checkpoint, bad_path)
+
+        with pytest.raises(ValueError, match=match):
+            run_execution_policy_evaluation(
+                ExecutionPolicyEvaluationCLIConfig(
+                    tape_root=str(tape_root),
+                    decision_grid_path=str(tape_root / "decision_grid"),
+                    checkpoint_path=str(bad_path),
+                    split_source_dataset_root=str(_split_source_root(tape_root)),
+                    eval_split="val",
+                    output_json=str(tmp_path / f"eval_removed_{field_name}.json"),
+                    overwrite=True,
+                    max_steps=4,
+                )
+            )
+
+
 def test_evaluate_execution_policy_uses_checkpoint_schema_without_control_fields(tmp_path):
     tape_root, checkpoint_path = _train_tiny_checkpoint(tmp_path)
     checkpoint = torch.load(checkpoint_path, map_location="cpu")

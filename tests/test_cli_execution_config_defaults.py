@@ -70,6 +70,11 @@ def _assert_default_env(env_config):
     assert env_config.fill_simulator_config.qty_epsilon == DEFAULT_QTY_EPSILON
     assert env_config.reward_config.reward_scale == 1.0
     assert env_config.fill_simulator_config.maker_fee_bps == DEFAULT_MAKER_FEE_BPS
+    assert env_config.observation_builder_config.inventory_qty_reference == DEFAULT_MAX_ORDER_QTY
+    assert (
+        env_config.observation_builder_config.inventory_qty_reference
+        == env_config.action_spec.max_order_qty
+    )
 
 
 def test_shared_colocated_balanced_defaults_are_exact():
@@ -93,6 +98,18 @@ def test_shared_colocated_balanced_defaults_are_exact():
 def test_execution_env_config_build_input_defaults_are_colocated_balanced():
     env_config = build_execution_env_config_from_input(ExecutionEnvConfigBuildInput())
     _assert_default_env(env_config)
+
+
+def test_execution_env_config_inventory_reference_tracks_max_order_qty():
+    default_env = build_execution_env_config_from_input(ExecutionEnvConfigBuildInput())
+    assert default_env.observation_builder_config.inventory_qty_reference == 0.003
+    assert default_env.action_spec.max_order_qty == 0.003
+
+    custom_env = build_execution_env_config_from_input(
+        ExecutionEnvConfigBuildInput(max_order_qty=0.005)
+    )
+    assert custom_env.action_spec.max_order_qty == 0.005
+    assert custom_env.observation_builder_config.inventory_qty_reference == 0.005
 
 
 def test_execution_cli_defaults_match_colocated_balanced_latency_reward():

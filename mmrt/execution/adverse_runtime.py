@@ -114,7 +114,6 @@ def build_executable_edge_observation_features(
             )
             if price_tick is None:
                 out[f"{prefix}_attempt_bps"] = 0.0
-                out[f"{prefix}_cond_fill_bps"] = 0.0
                 out[f"{prefix}_allowed"] = 0.0
                 out[f"{prefix}_valid"] = 0.0
                 continue
@@ -129,7 +128,6 @@ def build_executable_edge_observation_features(
                 config=config.executable_edge,
             )
             out[f"{prefix}_attempt_bps"] = float(edge.edge_attempt_bps)
-            out[f"{prefix}_cond_fill_bps"] = float(edge.edge_cond_fill_bps)
             out[f"{prefix}_allowed"] = 1.0 if edge.quote_allowed else 0.0
             out[f"{prefix}_valid"] = 1.0
     return out

@@ -80,7 +80,7 @@ POSITION_FIELDS = (
     "cash",
     "inventory_qty",
     "inventory_notional",
-    "inventory_notional_bps",
+    "inventory_order_units",
     "equity",
     "inventory_abs_notional",
     "fees_paid",
@@ -132,6 +132,22 @@ DEFAULT_OBSERVATION_FIELDS = (
     *TIME_FIELDS,
 )
 
+REMOVED_OBSERVATION_FIELDS_EXACT = frozenset({
+    "inventory_notional_bps",
+})
+
+
+def is_removed_observation_field(name: str) -> bool:
+    return name in REMOVED_OBSERVATION_FIELDS_EXACT or (
+        name.startswith("edge_") and name.endswith("_cond_fill_bps")
+    )
+
+
+def _removed_observation_field_message(name: str) -> str:
+    if name == "inventory_notional_bps":
+        return "observation field inventory_notional_bps was removed because it is numerically unstable"
+    return f"observation field {name} was removed because conditional-fill edge is numerically unstable"
+
 
 @dataclass(frozen=True, slots=True)
 class ObservationSchema:
@@ -147,6 +163,9 @@ class ObservationSchema:
             if name in seen:
                 raise ValueError(f"duplicate observation field name: {name!r}")
             seen.add(name)
+        for name in names:
+            if is_removed_observation_field(name):
+                raise ValueError(_removed_observation_field_message(name))
         if self.dtype not in ALLOWED_OBSERVATION_DTYPES:
             raise ValueError(f"dtype must be one of {ALLOWED_OBSERVATION_DTYPES}")
         object.__setattr__(self, "field_names", names)
@@ -222,8 +241,6 @@ def executable_edge_fields(
         fields.extend((
             f"edge_bid_{c}_attempt_bps",
             f"edge_ask_{c}_attempt_bps",
-            f"edge_bid_{c}_cond_fill_bps",
-            f"edge_ask_{c}_cond_fill_bps",
             f"edge_bid_{c}_allowed",
             f"edge_ask_{c}_allowed",
             f"edge_bid_{c}_valid",
@@ -319,7 +336,9 @@ __all__ = [
     "FILLS_FIELDS",
     "TIME_FIELDS",
     "DEFAULT_OBSERVATION_FIELDS",
+    "REMOVED_OBSERVATION_FIELDS_EXACT",
     "ObservationSchema",
+    "is_removed_observation_field",
     "adverse_selection_fields",
     "executable_edge_fields",
     "execution_observation_fields",
