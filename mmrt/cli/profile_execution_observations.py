@@ -22,6 +22,13 @@ from mmrt.execution.linear_signal import (
 from mmrt.execution.obs_schema import ObservationSchema, observation_field_groups
 from mmrt.execution.quote_geometry import QuoteAction
 from mmrt.execution.split_contract import load_execution_split_contract, ranges_for_split, split_contracts_equal
+from mmrt.cli.alpha_actionability import (
+    DEFAULT_ALPHA_ACTIONABILITY_MAX_ROWS,
+    DEFAULT_ALPHA_ACTIONABILITY_PERCENTILES,
+    DEFAULT_ALPHA_ACTIONABILITY_RANDOM_SEED,
+    compute_alpha_actionability_summary,
+    parse_alpha_actionability_percentiles,
+)
 from mmrt.cli.execution_defaults import (
     DEFAULT_CANCEL_GUARD_TICKS,
     DEFAULT_CANCEL_LATENCY_US,
@@ -188,6 +195,7 @@ class ExecutionObservationProfileConfig:
     output_json: str
 
     adverse_signals_npz: str | None = None
+    adverse_dataset_root: str | None = None
     checkpoint_path: str | None = None
     sample_rows: int = 100_000
     num_envs: int = 4
@@ -197,6 +205,10 @@ class ExecutionObservationProfileConfig:
     dtype: torch.dtype | str = torch.float32
     stdout_mode: str = "summary"
     overwrite: bool = False
+    alpha_actionability: bool = False
+    alpha_actionability_max_rows: int = DEFAULT_ALPHA_ACTIONABILITY_MAX_ROWS
+    alpha_actionability_percentiles: tuple[int, ...] | str = DEFAULT_ALPHA_ACTIONABILITY_PERCENTILES
+    alpha_actionability_random_seed: int = DEFAULT_ALPHA_ACTIONABILITY_RANDOM_SEED
 
     cancel_guard_ticks: int | None = None
     max_episode_steps: int | None = None
@@ -233,6 +245,8 @@ class ExecutionObservationProfileConfig:
         _require_nonempty_str(self.output_json, "output_json")
         if self.adverse_signals_npz is not None:
             _require_nonempty_str(self.adverse_signals_npz, "adverse_signals_npz")
+        if self.adverse_dataset_root is not None:
+            _require_nonempty_str(self.adverse_dataset_root, "adverse_dataset_root")
         if self.checkpoint_path is not None:
             _require_nonempty_str(self.checkpoint_path, "checkpoint_path")
         _require_positive_int(self.sample_rows, "sample_rows")
@@ -247,6 +261,16 @@ class ExecutionObservationProfileConfig:
         object.__setattr__(self, "dtype", _coerce_dtype(self.dtype))
         object.__setattr__(self, "stdout_mode", validate_stdout_mode(self.stdout_mode))
         _require_bool(self.overwrite, "overwrite")
+        _require_bool(self.alpha_actionability, "alpha_actionability")
+        _require_positive_int(self.alpha_actionability_max_rows, "alpha_actionability_max_rows")
+        _optional_nonnegative_int(self.alpha_actionability_random_seed, "alpha_actionability_random_seed")
+        object.__setattr__(
+            self,
+            "alpha_actionability_percentiles",
+            parse_alpha_actionability_percentiles(self.alpha_actionability_percentiles),
+        )
+        if self.alpha_actionability and self.adverse_dataset_root is None:
+            raise ValueError("alpha_actionability requires adverse_dataset_root")
         for key in ("cancel_guard_ticks", "max_distance_ticks", "post_only_gap_ticks"):
             value = getattr(self, key)
             if value is not None:
@@ -285,6 +309,7 @@ def _summary_config(config: ExecutionObservationProfileConfig, env_raw: Mapping[
         "split": config.split,
         "linear_signals_npz": config.linear_signals_npz,
         "adverse_signals_npz": config.adverse_signals_npz,
+        "adverse_dataset_root": config.adverse_dataset_root,
         "checkpoint_path": config.checkpoint_path,
         "sample_rows": config.sample_rows,
         "num_envs": config.num_envs,
@@ -294,6 +319,10 @@ def _summary_config(config: ExecutionObservationProfileConfig, env_raw: Mapping[
         "dtype": str(config.dtype),
         "stdout_mode": config.stdout_mode,
         "overwrite": config.overwrite,
+        "alpha_actionability": config.alpha_actionability,
+        "alpha_actionability_max_rows": config.alpha_actionability_max_rows,
+        "alpha_actionability_percentiles": list(config.alpha_actionability_percentiles),
+        "alpha_actionability_random_seed": config.alpha_actionability_random_seed,
         **{key: _json_safe_env_value(value) for key, value in env_raw.items() if key in _ENV_OVERRIDE_KEYS},
     }
 
@@ -845,6 +874,20 @@ def run_execution_observation_profile(config: ExecutionObservationProfileConfig)
     )
     groups = _group_summary(field_stats)
     compact = _overall_summary(field_stats, sample_rows=int(raw_observations.shape[0]), normalization_source=normalization_source)
+    if config.alpha_actionability:
+        alpha_actionability_summary = compute_alpha_actionability_summary(
+            adverse_dataset_root=config.adverse_dataset_root or "",
+            split=config.split,
+            split_contract=split_contract,
+            decision_grid_hash=decision_grid.decision_grid_hash,
+            decision_grid_n_rows=decision_grid.n_rows,
+            linear_signals=linear_signals,
+            max_rows=config.alpha_actionability_max_rows,
+            percentiles=config.alpha_actionability_percentiles,
+            seed=config.alpha_actionability_random_seed,
+        )
+    else:
+        alpha_actionability_summary = {"enabled": False}
     normalizer_count = float(normalizer.running.count.detach().cpu().item())
     clip = normalizer.config.clip
     observation_groups = observation_field_groups()
@@ -889,6 +932,7 @@ def run_execution_observation_profile(config: ExecutionObservationProfileConfig)
             "clip": clip,
             "normalizer_count": normalizer_count,
         },
+        "alpha_actionability_summary": alpha_actionability_summary,
         "sample": sample_summary,
         "field_stats": field_stats,
         "group_summary": groups,
@@ -929,7 +973,100 @@ def _print_stdout(stdout_mode: str, payload: Mapping[str, object], output_json: 
     )
     print("top_clip: " + " ".join(compact.get("top_clip_fields", [])))
     print("top_warnings: " + " ".join(compact.get("top_warning_fields", [])))
+    _print_alpha_actionability_summary(payload)
     print(f"output_json={output_json}")
+
+
+def _fmt_optional(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, (int, float)):
+        return f"{float(value):.6g}"
+    return str(value)
+
+
+def _alpha_compact(payload: Mapping[str, object]) -> Mapping[str, object] | None:
+    alpha = payload.get("alpha_actionability_summary")
+    if not isinstance(alpha, Mapping) or not alpha.get("enabled"):
+        return None
+    compact = alpha.get("compact")
+    return compact if isinstance(compact, Mapping) else {}
+
+
+def _alpha_sample(payload: Mapping[str, object]) -> Mapping[str, object]:
+    alpha = payload.get("alpha_actionability_summary")
+    if not isinstance(alpha, Mapping):
+        return {}
+    sample = alpha.get("sample")
+    return sample if isinstance(sample, Mapping) else {}
+
+
+def _print_alpha_actionability_summary(payload: Mapping[str, object]) -> None:
+    compact = _alpha_compact(payload)
+    if compact is None:
+        return
+    alpha = payload["alpha_actionability_summary"]
+    assert isinstance(alpha, Mapping)
+    sample = _alpha_sample(payload)
+    print(
+        "alpha_actionability: enabled "
+        f"source=empirical_labels rows={sample.get('rows_sampled')} split={alpha.get('selected_split')}"
+    )
+    print(
+        "direction_score top10: "
+        f"bid_touch_fill={_fmt_optional(compact.get('direction_score_top10_bid_touch_fill_rate'))} "
+        f"lift={_fmt_optional(compact.get('direction_score_top10_bid_touch_fill_lift'))} "
+        f"ask_touch_opposite={_fmt_optional(_alpha_bucket_metric(alpha, 'direction_score', 'top_10', 'ask_touch', 'fill_rate'))}"
+    )
+    print(
+        "direction_score bottom10: "
+        f"ask_touch_fill={_fmt_optional(compact.get('direction_score_bottom10_ask_touch_fill_rate'))} "
+        f"lift={_fmt_optional(compact.get('direction_score_bottom10_ask_touch_fill_lift'))} "
+        f"bid_touch_opposite={_fmt_optional(_alpha_bucket_metric(alpha, 'direction_score', 'bottom_10', 'bid_touch', 'fill_rate'))}"
+    )
+    print(
+        "direction_score top20/bottom20: "
+        f"bid_touch_fill={_fmt_optional(compact.get('direction_score_top20_bid_touch_fill_rate'))} "
+        f"ask_touch_fill={_fmt_optional(compact.get('direction_score_bottom20_ask_touch_fill_rate'))}"
+    )
+    print(
+        "signed_move_prob top10/bottom10: "
+        f"bid_touch_fill={_fmt_optional(compact.get('signed_move_prob_top10_bid_touch_fill_rate'))} "
+        f"ask_touch_fill={_fmt_optional(compact.get('signed_move_prob_bottom10_ask_touch_fill_rate'))}"
+    )
+    print(
+        "expected_return_bps top10/bottom10: "
+        f"bid_touch_fill={_fmt_optional(compact.get('expected_return_bps_top10_bid_touch_fill_rate'))} "
+        f"ask_touch_fill={_fmt_optional(compact.get('expected_return_bps_bottom10_ask_touch_fill_rate'))}"
+    )
+
+
+def _alpha_bucket_metric(
+    alpha: Mapping[str, object],
+    axis_name: str,
+    bucket_name: str,
+    quote_name: str,
+    metric_name: str,
+) -> object:
+    axes = alpha.get("axes")
+    if not isinstance(axes, Mapping):
+        return None
+    axis = axes.get(axis_name)
+    if not isinstance(axis, Mapping):
+        return None
+    buckets = axis.get("buckets")
+    if not isinstance(buckets, Mapping):
+        return None
+    bucket = buckets.get(bucket_name)
+    if not isinstance(bucket, Mapping):
+        return None
+    quotes = bucket.get("quotes")
+    if not isinstance(quotes, Mapping):
+        return None
+    quote = quotes.get(quote_name)
+    if not isinstance(quote, Mapping):
+        return None
+    return quote.get(metric_name)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -941,6 +1078,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--linear-signals-npz", required=True)
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--adverse-signals-npz")
+    parser.add_argument("--adverse-dataset-root")
     parser.add_argument("--checkpoint-path")
     parser.add_argument("--sample-rows", type=int, default=100_000)
     parser.add_argument("--num-envs", type=int, default=4)
@@ -963,6 +1101,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--unknown-level-queue-ahead-qty", type=float)
     parser.add_argument("--stdout-mode", choices=STDOUT_MODES, default="summary")
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--alpha-actionability", action="store_true")
+    parser.add_argument("--alpha-actionability-max-rows", type=int, default=DEFAULT_ALPHA_ACTIONABILITY_MAX_ROWS)
+    parser.add_argument("--alpha-actionability-percentiles", default="10,20")
+    parser.add_argument("--alpha-actionability-random-seed", type=int, default=DEFAULT_ALPHA_ACTIONABILITY_RANDOM_SEED)
     return parser
 
 
@@ -975,6 +1117,7 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionObservationProfileCo
         linear_signals_npz=args.linear_signals_npz,
         output_json=args.output_json,
         adverse_signals_npz=args.adverse_signals_npz,
+        adverse_dataset_root=args.adverse_dataset_root,
         checkpoint_path=args.checkpoint_path,
         sample_rows=args.sample_rows,
         num_envs=args.num_envs,
@@ -984,6 +1127,10 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionObservationProfileCo
         dtype=args.dtype,
         stdout_mode=args.stdout_mode,
         overwrite=args.overwrite,
+        alpha_actionability=args.alpha_actionability,
+        alpha_actionability_max_rows=args.alpha_actionability_max_rows,
+        alpha_actionability_percentiles=args.alpha_actionability_percentiles,
+        alpha_actionability_random_seed=args.alpha_actionability_random_seed,
         max_episode_steps=args.max_episode_steps,
         queue_mode=args.queue_mode,
         maker_fee_bps=args.maker_fee_bps,
