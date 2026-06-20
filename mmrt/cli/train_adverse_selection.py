@@ -38,6 +38,19 @@ from mmrt.execution.adverse_selection_dataset import (
 )
 from mmrt.execution.adverse_selection_fit import fit_adverse_baselines_streaming
 from mmrt.execution.split_contract import load_execution_split_contract
+from mmrt.cli.execution_defaults import (
+    DEFAULT_ADVERSE_HORIZON_US,
+    DEFAULT_DECISION_COMPUTE_LATENCY_US,
+    DEFAULT_DEDUPE_L2_DECREASE_WITH_TRADE_PRINTS,
+    DEFAULT_FILL_HORIZON_US,
+    DEFAULT_L2_DECREASE_WEIGHT,
+    DEFAULT_ORDER_ENTRY_LATENCY_US,
+    DEFAULT_ORDER_QTY,
+    DEFAULT_POST_ONLY_GAP_TICKS,
+    DEFAULT_QUEUE_MODE,
+    DEFAULT_TRADE_AT_LEVEL_WEIGHT,
+    DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY,
+)
 
 __all__ = [
     "AdverseSelectionTrainCLIConfig",
@@ -224,20 +237,20 @@ class AdverseSelectionTrainCLIConfig:
     kyle_use_notional_flow: bool = False
 
     quote_candidates: tuple[QuoteCandidateConfig, ...] | str = DEFAULT_QUOTE_CANDIDATES
-    post_only_gap_ticks: int = 1
-    decision_compute_latency_us: int = 50
-    order_entry_latency_us: int = 500
+    post_only_gap_ticks: int = DEFAULT_POST_ONLY_GAP_TICKS
+    decision_compute_latency_us: int = DEFAULT_DECISION_COMPUTE_LATENCY_US
+    order_entry_latency_us: int = DEFAULT_ORDER_ENTRY_LATENCY_US
     invalid_quote_policy: str = "mask"
-    order_qty: float = 0.001
-    fill_horizon_us: int = 1_000_000
-    adverse_horizon_us: int = 1_000_000
+    order_qty: float = DEFAULT_ORDER_QTY
+    fill_horizon_us: int = DEFAULT_FILL_HORIZON_US
+    adverse_horizon_us: int = DEFAULT_ADVERSE_HORIZON_US
     toxic_threshold_bps: float = 0.0
 
-    queue_mode: QueueModelMode | str = QueueModelMode.CONSERVATIVE
-    l2_decrease_weight: float = 0.25
-    trade_at_level_weight: float = 0.5
-    unknown_level_queue_ahead_qty: float = 1_000_000_000.0
-    dedupe_l2_decrease_with_trade_prints: bool = True
+    queue_mode: QueueModelMode | str = DEFAULT_QUEUE_MODE
+    l2_decrease_weight: float = DEFAULT_L2_DECREASE_WEIGHT
+    trade_at_level_weight: float = DEFAULT_TRADE_AT_LEVEL_WEIGHT
+    unknown_level_queue_ahead_qty: float = DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY
+    dedupe_l2_decrease_with_trade_prints: bool = DEFAULT_DEDUPE_L2_DECREASE_WITH_TRADE_PRINTS
 
     ridge_l2: float = 1e-3
     min_train_samples: int = 10
@@ -691,18 +704,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--kyle-min-samples", type=int, default=5)
     parser.add_argument("--kyle-use-notional-flow", action="store_true")
     parser.add_argument("--quote-candidates", default="touch,inside_1,away_1", help="Comma-separated quote candidates: touch, inside_1, away_1.")
-    parser.add_argument("--post-only-gap-ticks", type=int, default=1)
-    parser.add_argument("--decision-compute-latency-us", type=int, default=50)
-    parser.add_argument("--order-entry-latency-us", type=int, default=500)
+    parser.add_argument("--post-only-gap-ticks", type=int, default=DEFAULT_POST_ONLY_GAP_TICKS)
+    parser.add_argument("--decision-compute-latency-us", type=int, default=DEFAULT_DECISION_COMPUTE_LATENCY_US)
+    parser.add_argument("--order-entry-latency-us", type=int, default=DEFAULT_ORDER_ENTRY_LATENCY_US)
     parser.add_argument("--invalid-quote-policy", choices=("mask", "error"), default="mask")
-    parser.add_argument("--order-qty", type=float, default=0.001)
-    parser.add_argument("--fill-horizon-us", type=int, default=1_000_000)
-    parser.add_argument("--adverse-horizon-us", type=int, default=1_000_000)
+    parser.add_argument("--order-qty", type=float, default=DEFAULT_ORDER_QTY)
+    parser.add_argument("--fill-horizon-us", type=int, default=DEFAULT_FILL_HORIZON_US)
+    parser.add_argument("--adverse-horizon-us", type=int, default=DEFAULT_ADVERSE_HORIZON_US)
     parser.add_argument("--toxic-threshold-bps", type=float, default=0.0)
-    parser.add_argument("--queue-mode", choices=("conservative", "balanced"), default="conservative")
-    parser.add_argument("--l2-decrease-weight", type=float, default=0.25)
-    parser.add_argument("--trade-at-level-weight", type=float, default=0.5)
-    parser.add_argument("--unknown-level-queue-ahead-qty", type=float, default=1_000_000_000.0)
+    parser.add_argument("--queue-mode", choices=("conservative", "balanced"), default=DEFAULT_QUEUE_MODE.value)
+    parser.add_argument("--l2-decrease-weight", type=float, default=DEFAULT_L2_DECREASE_WEIGHT)
+    parser.add_argument("--trade-at-level-weight", type=float, default=DEFAULT_TRADE_AT_LEVEL_WEIGHT)
+    parser.add_argument("--unknown-level-queue-ahead-qty", type=float, default=DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY)
     parser.add_argument(
         "--no-dedupe-l2-decrease-with-trade-prints",
         action="store_true",

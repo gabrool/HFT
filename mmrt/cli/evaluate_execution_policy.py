@@ -33,6 +33,22 @@ from mmrt.execution.split_contract import (
     split_contracts_equal,
     validate_split_contract_payload,
 )
+from mmrt.cli.execution_defaults import (
+    DEFAULT_CANCEL_GUARD_TICKS,
+    DEFAULT_CANCEL_LATENCY_US,
+    DEFAULT_DECISION_COMPUTE_LATENCY_US,
+    DEFAULT_DEFAULT_ORDER_QTY,
+    DEFAULT_DEDUPE_L2_DECREASE_WITH_TRADE_PRINTS,
+    DEFAULT_L2_DECREASE_WEIGHT,
+    DEFAULT_MAKER_FEE_BPS,
+    DEFAULT_MAX_DISTANCE_TICKS,
+    DEFAULT_MAX_ORDER_QTY,
+    DEFAULT_ORDER_ENTRY_LATENCY_US,
+    DEFAULT_POST_ONLY_GAP_TICKS,
+    DEFAULT_QUEUE_MODE,
+    DEFAULT_TRADE_AT_LEVEL_WEIGHT,
+    DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY,
+)
 from mmrt.cli.linear_signal_validation import validate_linear_signals_for_execution_tape
 from mmrt.cli.execution_env_config import (
     ExecutionEnvConfigBuildInput,
@@ -189,28 +205,28 @@ class ExecutionPolicyEvaluationCLIConfig:
     overwrite: bool = False
     mmap_mode: str | None = "r"
 
-    cancel_guard_ticks: int = 2
+    cancel_guard_ticks: int = DEFAULT_CANCEL_GUARD_TICKS
     max_episode_steps: int | None = None
 
-    max_distance_ticks: int = 1
-    max_order_qty: float = 0.001
-    post_only_gap_ticks: int = 1
-    default_order_qty: float = 0.001
+    max_distance_ticks: int = DEFAULT_MAX_DISTANCE_TICKS
+    max_order_qty: float = DEFAULT_MAX_ORDER_QTY
+    post_only_gap_ticks: int = DEFAULT_POST_ONLY_GAP_TICKS
+    default_order_qty: float = DEFAULT_DEFAULT_ORDER_QTY
 
-    queue_mode: QueueModelMode | str = QueueModelMode.CONSERVATIVE
-    l2_decrease_weight: float = 0.25
-    trade_at_level_weight: float = 0.5
-    unknown_level_queue_ahead_qty: float = 1_000_000_000.0
-    dedupe_l2_decrease_with_trade_prints: bool = True
+    queue_mode: QueueModelMode | str = DEFAULT_QUEUE_MODE
+    l2_decrease_weight: float = DEFAULT_L2_DECREASE_WEIGHT
+    trade_at_level_weight: float = DEFAULT_TRADE_AT_LEVEL_WEIGHT
+    unknown_level_queue_ahead_qty: float = DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY
+    dedupe_l2_decrease_with_trade_prints: bool = DEFAULT_DEDUPE_L2_DECREASE_WITH_TRADE_PRINTS
 
-    maker_fee_bps: float = 0.0
+    maker_fee_bps: float = DEFAULT_MAKER_FEE_BPS
     edge_min_executable_edge_bps: float = 0.0
     edge_latency_buffer_bps: float = 0.0
     edge_inventory_skew_bps_per_unit: float = 0.0
 
-    decision_compute_latency_us: int = 50
-    order_entry_latency_us: int = 500
-    cancel_latency_us: int = 500
+    decision_compute_latency_us: int = DEFAULT_DECISION_COMPUTE_LATENCY_US
+    order_entry_latency_us: int = DEFAULT_ORDER_ENTRY_LATENCY_US
+    cancel_latency_us: int = DEFAULT_CANCEL_LATENCY_US
 
     inventory_penalty_bps: float = 0.0
     turnover_penalty_bps: float = 0.0
@@ -1069,28 +1085,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--no-mmap", action="store_true")
 
-    parser.add_argument("--cancel-guard-ticks", type=int, default=2)
+    parser.add_argument("--cancel-guard-ticks", type=int, default=DEFAULT_CANCEL_GUARD_TICKS)
     parser.add_argument("--max-episode-steps", type=int)
-    parser.add_argument("--max-distance-ticks", type=int, default=1)
-    parser.add_argument("--max-order-qty", type=float, default=0.001)
-    parser.add_argument("--post-only-gap-ticks", type=int, default=1)
-    parser.add_argument("--default-order-qty", type=float, default=0.001)
-    parser.add_argument("--queue-mode", choices=("conservative", "balanced"), default="conservative")
-    parser.add_argument("--l2-decrease-weight", type=float, default=0.25)
-    parser.add_argument("--trade-at-level-weight", type=float, default=0.5)
-    parser.add_argument("--unknown-level-queue-ahead-qty", type=float, default=1000000000.0)
+    parser.add_argument("--max-distance-ticks", type=int, default=DEFAULT_MAX_DISTANCE_TICKS)
+    parser.add_argument("--max-order-qty", type=float, default=DEFAULT_MAX_ORDER_QTY)
+    parser.add_argument("--post-only-gap-ticks", type=int, default=DEFAULT_POST_ONLY_GAP_TICKS)
+    parser.add_argument("--default-order-qty", type=float, default=DEFAULT_DEFAULT_ORDER_QTY)
+    parser.add_argument("--queue-mode", choices=("conservative", "balanced"), default=DEFAULT_QUEUE_MODE.value)
+    parser.add_argument("--l2-decrease-weight", type=float, default=DEFAULT_L2_DECREASE_WEIGHT)
+    parser.add_argument("--trade-at-level-weight", type=float, default=DEFAULT_TRADE_AT_LEVEL_WEIGHT)
+    parser.add_argument("--unknown-level-queue-ahead-qty", type=float, default=DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY)
     parser.add_argument(
         "--no-dedupe-l2-decrease-with-trade-prints",
         action="store_true",
         help="Disable de-duplication of L2 visible decreases already explained by same-level trade prints.",
     )
-    parser.add_argument("--maker-fee-bps", type=float, default=0.0)
+    parser.add_argument("--maker-fee-bps", type=float, default=DEFAULT_MAKER_FEE_BPS)
     parser.add_argument("--edge-min-executable-edge-bps", type=float, default=0.0)
     parser.add_argument("--edge-latency-buffer-bps", type=float, default=0.0)
     parser.add_argument("--edge-inventory-skew-bps-per-unit", type=float, default=0.0)
-    parser.add_argument("--decision-compute-latency-us", type=int, default=50)
-    parser.add_argument("--order-entry-latency-us", type=int, default=500)
-    parser.add_argument("--cancel-latency-us", type=int, default=500)
+    parser.add_argument("--decision-compute-latency-us", type=int, default=DEFAULT_DECISION_COMPUTE_LATENCY_US)
+    parser.add_argument("--order-entry-latency-us", type=int, default=DEFAULT_ORDER_ENTRY_LATENCY_US)
+    parser.add_argument("--cancel-latency-us", type=int, default=DEFAULT_CANCEL_LATENCY_US)
     parser.add_argument("--inventory-penalty-bps", type=float, default=0.0)
     parser.add_argument("--turnover-penalty-bps", type=float, default=0.0)
     parser.add_argument("--cancel-penalty", type=float, default=0.0)

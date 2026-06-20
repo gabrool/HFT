@@ -10,7 +10,7 @@ import torch
 
 from mmrt.features.schedule import DecisionScheduleConfig
 from mmrt.contracts import AggressorSide
-from mmrt.execution.contracts import BookLevelSnapshot, BookTop, LatencyConfig, SymbolSpec, TradePrint
+from mmrt.execution.contracts import BookLevelSnapshot, BookTop, LatencyConfig, QueueModelMode, SymbolSpec, TradePrint
 from mmrt.execution.env import ExecutionEnv, ExecutionEnvConfig
 from mmrt.execution.obs_schema import CONTROL_FIELDS
 from mmrt.execution.event_merge import merge_execution_events
@@ -31,6 +31,21 @@ from mmrt.execution.linear_signal import (
 )
 from mmrt.execution.split_contract import DecisionSplitRange
 from mmrt.cli.train_execution_ppo import ExecutionPPOTrainCLIConfig, run_execution_ppo_training
+from mmrt.cli.execution_defaults import (
+    DEFAULT_CANCEL_GUARD_TICKS,
+    DEFAULT_CANCEL_LATENCY_US,
+    DEFAULT_DECISION_COMPUTE_LATENCY_US,
+    DEFAULT_DEFAULT_ORDER_QTY,
+    DEFAULT_L2_DECREASE_WEIGHT,
+    DEFAULT_MAKER_FEE_BPS,
+    DEFAULT_MAX_DISTANCE_TICKS,
+    DEFAULT_MAX_ORDER_QTY,
+    DEFAULT_ORDER_ENTRY_LATENCY_US,
+    DEFAULT_POST_ONLY_GAP_TICKS,
+    DEFAULT_QTY_EPSILON,
+    DEFAULT_TRADE_AT_LEVEL_WEIGHT,
+    DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY,
+)
 from mmrt.cli.evaluate_execution_policy import (
     ExecutionPolicyEvaluationCLIConfig,
     _adverse_queue_config_compatibility,
@@ -1116,24 +1131,83 @@ def test_parser_dedupe_l2_trade_default_enabled():
     assert config.dedupe_l2_decrease_with_trade_prints is True
 
 
-def _eval_adverse_label_config(queue_mode: str, *, qty_epsilon: float = 1e-12) -> dict[str, object]:
+def test_override_env_config_parser_defaults_are_colocated_balanced():
+    from mmrt.cli.evaluate_execution_policy import build_arg_parser, _config_from_args
+
+    parser = build_arg_parser()
+    args = parser.parse_args([
+        "--tape-root", "/tmp/tape",
+        "--decision-grid", "/tmp/tape/decision_grid",
+        "--checkpoint-path", "/tmp/ckpt.pt",
+        "--split-source-dataset-root", "/tmp/split-source",
+        "--eval-split", "val",
+        "--override-env-config",
+    ])
+    config = _config_from_args(args)
+    env_config = _env_config_from_cli_config(config)
+    queue = env_config.fill_simulator_config.queue_model
+
+    assert config.cancel_guard_ticks == DEFAULT_CANCEL_GUARD_TICKS
+    assert config.max_distance_ticks == DEFAULT_MAX_DISTANCE_TICKS
+    assert config.max_order_qty == DEFAULT_MAX_ORDER_QTY
+    assert config.default_order_qty == DEFAULT_DEFAULT_ORDER_QTY
+    assert config.post_only_gap_ticks == DEFAULT_POST_ONLY_GAP_TICKS
+    assert config.queue_mode == QueueModelMode.BALANCED
+    assert config.l2_decrease_weight == DEFAULT_L2_DECREASE_WEIGHT
+    assert config.trade_at_level_weight == DEFAULT_TRADE_AT_LEVEL_WEIGHT
+    assert config.unknown_level_queue_ahead_qty == DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY
+    assert config.maker_fee_bps == DEFAULT_MAKER_FEE_BPS
+    assert config.decision_compute_latency_us == DEFAULT_DECISION_COMPUTE_LATENCY_US
+    assert config.order_entry_latency_us == DEFAULT_ORDER_ENTRY_LATENCY_US
+    assert config.cancel_latency_us == DEFAULT_CANCEL_LATENCY_US
+    assert env_config.cancel_guard_ticks == DEFAULT_CANCEL_GUARD_TICKS
+    assert env_config.action_spec.max_distance_ticks == DEFAULT_MAX_DISTANCE_TICKS
+    assert env_config.action_spec.max_order_qty == DEFAULT_MAX_ORDER_QTY
+    assert queue.mode == QueueModelMode.BALANCED
+    assert queue.l2_decrease_weight == DEFAULT_L2_DECREASE_WEIGHT
+    assert queue.trade_at_level_weight == DEFAULT_TRADE_AT_LEVEL_WEIGHT
+    assert queue.unknown_level_queue_ahead_qty == DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY
+    assert queue.qty_epsilon == DEFAULT_QTY_EPSILON
+
+
+def _eval_adverse_label_config(
+    queue_mode: str,
+    *,
+    qty_epsilon: float = DEFAULT_QTY_EPSILON,
+    old_defaults: bool = False,
+) -> dict[str, object]:
+    if old_defaults:
+        l2_decrease_weight = 0.25
+        trade_at_level_weight = 0.5
+        unknown_level_queue_ahead_qty = 1_000_000_000.0
+        order_entry_latency_us = 500
+    else:
+        l2_decrease_weight = DEFAULT_L2_DECREASE_WEIGHT
+        trade_at_level_weight = DEFAULT_TRADE_AT_LEVEL_WEIGHT
+        unknown_level_queue_ahead_qty = DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY
+        order_entry_latency_us = DEFAULT_ORDER_ENTRY_LATENCY_US
     return {
         "queue_mode": queue_mode,
-        "l2_decrease_weight": 0.25,
-        "trade_at_level_weight": 0.5,
+        "l2_decrease_weight": l2_decrease_weight,
+        "trade_at_level_weight": trade_at_level_weight,
         "dedupe_l2_decrease_with_trade_prints": True,
-        "unknown_level_queue_ahead_qty": 1_000_000_000.0,
+        "unknown_level_queue_ahead_qty": unknown_level_queue_ahead_qty,
         "qty_epsilon": qty_epsilon,
-        "order_entry_latency_us": 500,
-        "decision_compute_latency_us": 50,
-        "post_only_gap_ticks": 1,
-        "order_qty": 0.001,
+        "order_entry_latency_us": order_entry_latency_us,
+        "decision_compute_latency_us": DEFAULT_DECISION_COMPUTE_LATENCY_US,
+        "post_only_gap_ticks": DEFAULT_POST_ONLY_GAP_TICKS,
+        "order_qty": DEFAULT_DEFAULT_ORDER_QTY,
         "fill_horizon_us": 1_000_000,
         "adverse_horizon_us": 1_000_000,
     }
 
 
-def _eval_adverse_signals(queue_mode: str, *, qty_epsilon: float = 1e-12) -> AdverseSelectionSignalArtifact:
+def _eval_adverse_signals(
+    queue_mode: str,
+    *,
+    qty_epsilon: float = DEFAULT_QTY_EPSILON,
+    old_defaults: bool = False,
+) -> AdverseSelectionSignalArtifact:
     return AdverseSelectionSignalArtifact(
         schema=ADVERSE_SELECTION_SIGNALS_SCHEMA,
         decision_local_ts_us=np.array([100], dtype=np.int64),
@@ -1141,7 +1215,7 @@ def _eval_adverse_signals(queue_mode: str, *, qty_epsilon: float = 1e-12) -> Adv
         decision_event_seq=np.array([0], dtype=np.int64),
         target_names=("bid_touch_filled",),
         predictions={"bid_touch_filled": np.array([0.5], dtype=np.float32)},
-        adverse_label_config=_eval_adverse_label_config(queue_mode, qty_epsilon=qty_epsilon),
+        adverse_label_config=_eval_adverse_label_config(queue_mode, qty_epsilon=qty_epsilon, old_defaults=old_defaults),
         **grid_lineage_fields(n_rows=1),
     )
 
@@ -1170,6 +1244,24 @@ def test_evaluation_adverse_signal_queue_guard_allows_only_explicit_mismatch():
     )
     assert allowed is not None
     assert allowed["status"] == "mismatch_allowed"
+
+
+def test_evaluation_override_defaults_reject_old_balanced_adverse_signals():
+    config = ExecutionPolicyEvaluationCLIConfig(
+        tape_root="/tmp/tape",
+        decision_grid_path="/tmp/tape/decision_grid",
+        checkpoint_path="/tmp/checkpoint.pt",
+        split_source_dataset_root="/tmp/split-source",
+        eval_split="val",
+        override_env_config=True,
+    )
+    env_config = _env_config_from_cli_config(config)
+    with pytest.raises(ValueError, match="adverse signal queue config mismatch"):
+        _adverse_queue_config_compatibility(
+            _eval_adverse_signals("balanced", old_defaults=True),
+            env_config=env_config,
+            allow_mismatch=False,
+        )
 
 
 def test_evaluation_adverse_signal_qty_epsilon_guard_allows_only_explicit_mismatch():
