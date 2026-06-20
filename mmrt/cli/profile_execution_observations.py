@@ -23,6 +23,9 @@ from mmrt.execution.obs_schema import ObservationSchema, observation_field_group
 from mmrt.execution.quote_geometry import QuoteAction
 from mmrt.execution.split_contract import load_execution_split_contract, ranges_for_split, split_contracts_equal
 from mmrt.cli.alpha_actionability import (
+    DEFAULT_ALPHA_ACTIONABILITY_CORRECTNESS_DEADBAND_BPS,
+    DEFAULT_ALPHA_ACTIONABILITY_DECISION_HORIZON_US,
+    DEFAULT_ALPHA_ACTIONABILITY_FILL_PLUS_HORIZON_US,
     DEFAULT_ALPHA_ACTIONABILITY_MAX_ROWS,
     DEFAULT_ALPHA_ACTIONABILITY_PERCENTILES,
     DEFAULT_ALPHA_ACTIONABILITY_RANDOM_SEED,
@@ -146,6 +149,13 @@ def _require_finite_float(value: float, name: str) -> float:
     return out
 
 
+def _require_nonnegative_finite_float(value: float, name: str) -> float:
+    out = _require_finite_float(value, name)
+    if out < 0.0:
+        raise ValueError(f"{name} must be finite and >= 0")
+    return out
+
+
 def _optional_finite_float(value: float | None, name: str) -> float | None:
     if value is None:
         return None
@@ -209,6 +219,9 @@ class ExecutionObservationProfileConfig:
     alpha_actionability_max_rows: int = DEFAULT_ALPHA_ACTIONABILITY_MAX_ROWS
     alpha_actionability_percentiles: tuple[int, ...] | str = DEFAULT_ALPHA_ACTIONABILITY_PERCENTILES
     alpha_actionability_random_seed: int = DEFAULT_ALPHA_ACTIONABILITY_RANDOM_SEED
+    alpha_actionability_decision_horizon_us: int = DEFAULT_ALPHA_ACTIONABILITY_DECISION_HORIZON_US
+    alpha_actionability_fill_plus_horizon_us: int = DEFAULT_ALPHA_ACTIONABILITY_FILL_PLUS_HORIZON_US
+    alpha_actionability_correctness_deadband_bps: float = DEFAULT_ALPHA_ACTIONABILITY_CORRECTNESS_DEADBAND_BPS
 
     cancel_guard_ticks: int | None = None
     max_episode_steps: int | None = None
@@ -264,6 +277,12 @@ class ExecutionObservationProfileConfig:
         _require_bool(self.alpha_actionability, "alpha_actionability")
         _require_positive_int(self.alpha_actionability_max_rows, "alpha_actionability_max_rows")
         _optional_nonnegative_int(self.alpha_actionability_random_seed, "alpha_actionability_random_seed")
+        _require_positive_int(self.alpha_actionability_decision_horizon_us, "alpha_actionability_decision_horizon_us")
+        _require_positive_int(self.alpha_actionability_fill_plus_horizon_us, "alpha_actionability_fill_plus_horizon_us")
+        _require_nonnegative_finite_float(
+            self.alpha_actionability_correctness_deadband_bps,
+            "alpha_actionability_correctness_deadband_bps",
+        )
         object.__setattr__(
             self,
             "alpha_actionability_percentiles",
@@ -323,6 +342,9 @@ def _summary_config(config: ExecutionObservationProfileConfig, env_raw: Mapping[
         "alpha_actionability_max_rows": config.alpha_actionability_max_rows,
         "alpha_actionability_percentiles": list(config.alpha_actionability_percentiles),
         "alpha_actionability_random_seed": config.alpha_actionability_random_seed,
+        "alpha_actionability_decision_horizon_us": config.alpha_actionability_decision_horizon_us,
+        "alpha_actionability_fill_plus_horizon_us": config.alpha_actionability_fill_plus_horizon_us,
+        "alpha_actionability_correctness_deadband_bps": config.alpha_actionability_correctness_deadband_bps,
         **{key: _json_safe_env_value(value) for key, value in env_raw.items() if key in _ENV_OVERRIDE_KEYS},
     }
 
@@ -882,9 +904,16 @@ def run_execution_observation_profile(config: ExecutionObservationProfileConfig)
             decision_grid_hash=decision_grid.decision_grid_hash,
             decision_grid_n_rows=decision_grid.n_rows,
             linear_signals=linear_signals,
+            execution_tape=tape,
+            decision_grid=decision_grid,
             max_rows=config.alpha_actionability_max_rows,
             percentiles=config.alpha_actionability_percentiles,
             seed=config.alpha_actionability_random_seed,
+            decision_horizon_us=config.alpha_actionability_decision_horizon_us,
+            fill_plus_horizon_us=config.alpha_actionability_fill_plus_horizon_us,
+            correctness_deadband_bps=config.alpha_actionability_correctness_deadband_bps,
+            maker_fee_bps=env_config.fill_simulator_config.maker_fee_bps,
+            post_only_gap_ticks=env_config.quote_geometry_config.post_only_gap_ticks,
         )
     else:
         alpha_actionability_summary = {"enabled": False}
@@ -1039,6 +1068,30 @@ def _print_alpha_actionability_summary(payload: Mapping[str, object]) -> None:
         f"bid_touch_fill={_fmt_optional(compact.get('expected_return_bps_top10_bid_touch_fill_rate'))} "
         f"ask_touch_fill={_fmt_optional(compact.get('expected_return_bps_bottom10_ask_touch_fill_rate'))}"
     )
+    print(
+        "signed_move_prob top10 bid_touch: "
+        f"fill={_fmt_optional(compact.get('signed_move_prob_top10_bid_touch_fill_rate'))} "
+        f"wrong_given_fill={_fmt_optional(compact.get('signed_move_prob_top10_bid_touch_wrong_rate_given_fill'))} "
+        f"wrong_lift={_fmt_optional(compact.get('signed_move_prob_top10_bid_touch_wrong_selection_lift'))} "
+        f"net_decision_attempt={_fmt_optional(compact.get('signed_move_prob_top10_bid_touch_decision_horizon_attempt_net_bps_mean'))} "
+        f"net_fill_plus_attempt={_fmt_optional(compact.get('signed_move_prob_top10_bid_touch_fill_plus_horizon_attempt_net_bps_mean'))}"
+    )
+    print(
+        "signed_move_prob bottom10 ask_touch: "
+        f"fill={_fmt_optional(compact.get('signed_move_prob_bottom10_ask_touch_fill_rate'))} "
+        f"wrong_given_fill={_fmt_optional(compact.get('signed_move_prob_bottom10_ask_touch_wrong_rate_given_fill'))} "
+        f"wrong_lift={_fmt_optional(compact.get('signed_move_prob_bottom10_ask_touch_wrong_selection_lift'))} "
+        f"net_decision_attempt={_fmt_optional(compact.get('signed_move_prob_bottom10_ask_touch_decision_horizon_attempt_net_bps_mean'))} "
+        f"net_fill_plus_attempt={_fmt_optional(compact.get('signed_move_prob_bottom10_ask_touch_fill_plus_horizon_attempt_net_bps_mean'))}"
+    )
+    markout_config = alpha.get("markout_config")
+    markout_config = markout_config if isinstance(markout_config, Mapping) else {}
+    print(
+        "alpha_markout: "
+        f"decision_horizon_us={markout_config.get('decision_horizon_us')} "
+        f"fill_plus_horizon_us={markout_config.get('fill_plus_horizon_us')} "
+        f"maker_fee_bps={_fmt_optional(markout_config.get('maker_fee_bps'))}"
+    )
 
 
 def _alpha_bucket_metric(
@@ -1105,6 +1158,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--alpha-actionability-max-rows", type=int, default=DEFAULT_ALPHA_ACTIONABILITY_MAX_ROWS)
     parser.add_argument("--alpha-actionability-percentiles", default="10,20")
     parser.add_argument("--alpha-actionability-random-seed", type=int, default=DEFAULT_ALPHA_ACTIONABILITY_RANDOM_SEED)
+    parser.add_argument("--alpha-actionability-decision-horizon-us", type=int, default=DEFAULT_ALPHA_ACTIONABILITY_DECISION_HORIZON_US)
+    parser.add_argument("--alpha-actionability-fill-plus-horizon-us", type=int, default=DEFAULT_ALPHA_ACTIONABILITY_FILL_PLUS_HORIZON_US)
+    parser.add_argument(
+        "--alpha-actionability-correctness-deadband-bps",
+        type=float,
+        default=DEFAULT_ALPHA_ACTIONABILITY_CORRECTNESS_DEADBAND_BPS,
+    )
     return parser
 
 
@@ -1131,6 +1191,9 @@ def _config_from_args(args: argparse.Namespace) -> ExecutionObservationProfileCo
         alpha_actionability_max_rows=args.alpha_actionability_max_rows,
         alpha_actionability_percentiles=args.alpha_actionability_percentiles,
         alpha_actionability_random_seed=args.alpha_actionability_random_seed,
+        alpha_actionability_decision_horizon_us=args.alpha_actionability_decision_horizon_us,
+        alpha_actionability_fill_plus_horizon_us=args.alpha_actionability_fill_plus_horizon_us,
+        alpha_actionability_correctness_deadband_bps=args.alpha_actionability_correctness_deadband_bps,
         max_episode_steps=args.max_episode_steps,
         queue_mode=args.queue_mode,
         maker_fee_bps=args.maker_fee_bps,
