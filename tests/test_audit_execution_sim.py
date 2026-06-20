@@ -14,6 +14,7 @@ from mmrt.execution.contracts import (
     FillReason,
     OrderSide,
     PositionState,
+    QueueModelMode,
     SymbolSpec,
     TradePrint,
 )
@@ -37,9 +38,24 @@ from mmrt.execution.metrics import ExecutionMetricAccumulator, summarize_executi
 from mmrt.execution.diagnostics import ExecutionDiagnosticsConfig, diagnose_execution_metrics
 from mmrt.cli.audit_execution_sim import (
     ExecutionSimAuditConfig,
+    _summary_config,
     build_arg_parser,
     run_execution_sim_audit,
     main,
+)
+from mmrt.cli.execution_defaults import (
+    DEFAULT_CANCEL_GUARD_TICKS,
+    DEFAULT_CANCEL_LATENCY_US,
+    DEFAULT_DECISION_COMPUTE_LATENCY_US,
+    DEFAULT_DEFAULT_ORDER_QTY,
+    DEFAULT_L2_DECREASE_WEIGHT,
+    DEFAULT_MAKER_FEE_BPS,
+    DEFAULT_MAX_DISTANCE_TICKS,
+    DEFAULT_MAX_ORDER_QTY,
+    DEFAULT_ORDER_ENTRY_LATENCY_US,
+    DEFAULT_POST_ONLY_GAP_TICKS,
+    DEFAULT_TRADE_AT_LEVEL_WEIGHT,
+    DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY,
 )
 from tests.grid_helpers import decision_grid_for_tape, grid_identity_fields
 
@@ -295,6 +311,7 @@ def test_bid_audit_records_trade_fill_and_reward(tmp_path):
             output_json=str(tmp_path / "summary.json"),
             policy="bid",
             max_steps=1,
+            max_distance_ticks=1,
             max_order_qty=1.0,
             default_order_qty=1.0,
             decision_compute_latency_us=0,
@@ -625,6 +642,45 @@ def test_parser_dedupe_l2_trade_default_enabled():
     args = parser.parse_args(["--tape-root", "/tmp/tape", "--decision-grid", "/tmp/tape/decision_grid"])
     config = ExecutionSimAuditConfig(tape_root=args.tape_root, decision_grid_path=args.decision_grid_path)
     assert config.dedupe_l2_decrease_with_trade_prints is True
+
+
+def test_parser_defaults_resolve_to_colocated_balanced_audit_config():
+    parser = build_arg_parser()
+    args = parser.parse_args(["--tape-root", "/tmp/tape", "--decision-grid", "/tmp/tape/decision_grid"])
+    config = ExecutionSimAuditConfig(
+        tape_root=args.tape_root,
+        decision_grid_path=args.decision_grid_path,
+        cancel_guard_ticks=args.cancel_guard_ticks,
+        max_distance_ticks=args.max_distance_ticks,
+        max_order_qty=args.max_order_qty,
+        post_only_gap_ticks=args.post_only_gap_ticks,
+        default_order_qty=args.default_order_qty,
+        queue_mode=args.queue_mode,
+        l2_decrease_weight=args.l2_decrease_weight,
+        trade_at_level_weight=args.trade_at_level_weight,
+        unknown_level_queue_ahead_qty=args.unknown_level_queue_ahead_qty,
+        maker_fee_bps=args.maker_fee_bps,
+        decision_compute_latency_us=args.decision_compute_latency_us,
+        order_entry_latency_us=args.order_entry_latency_us,
+        cancel_latency_us=args.cancel_latency_us,
+    )
+    summary = _summary_config(config)
+
+    assert config.cancel_guard_ticks == DEFAULT_CANCEL_GUARD_TICKS
+    assert config.max_distance_ticks == DEFAULT_MAX_DISTANCE_TICKS
+    assert config.max_order_qty == DEFAULT_MAX_ORDER_QTY
+    assert config.default_order_qty == DEFAULT_DEFAULT_ORDER_QTY
+    assert config.post_only_gap_ticks == DEFAULT_POST_ONLY_GAP_TICKS
+    assert config.queue_mode == QueueModelMode.BALANCED
+    assert config.l2_decrease_weight == DEFAULT_L2_DECREASE_WEIGHT
+    assert config.trade_at_level_weight == DEFAULT_TRADE_AT_LEVEL_WEIGHT
+    assert config.unknown_level_queue_ahead_qty == DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY
+    assert config.maker_fee_bps == DEFAULT_MAKER_FEE_BPS
+    assert config.decision_compute_latency_us == DEFAULT_DECISION_COMPUTE_LATENCY_US
+    assert config.order_entry_latency_us == DEFAULT_ORDER_ENTRY_LATENCY_US
+    assert config.cancel_latency_us == DEFAULT_CANCEL_LATENCY_US
+    assert summary["queue_mode"] == "balanced"
+    assert summary["maker_fee_bps"] == DEFAULT_MAKER_FEE_BPS
 
 
 def test_audit_env_config_uses_shared_builder_source_guard():

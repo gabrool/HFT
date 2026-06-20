@@ -22,6 +22,22 @@ from mmrt.execution.linear_signal import (
 from mmrt.execution.obs_schema import ObservationSchema, observation_field_groups
 from mmrt.execution.quote_geometry import QuoteAction
 from mmrt.execution.split_contract import load_execution_split_contract, ranges_for_split, split_contracts_equal
+from mmrt.cli.execution_defaults import (
+    DEFAULT_CANCEL_GUARD_TICKS,
+    DEFAULT_CANCEL_LATENCY_US,
+    DEFAULT_DECISION_COMPUTE_LATENCY_US,
+    DEFAULT_DEFAULT_ORDER_QTY,
+    DEFAULT_DEDUPE_L2_DECREASE_WITH_TRADE_PRINTS,
+    DEFAULT_L2_DECREASE_WEIGHT,
+    DEFAULT_MAKER_FEE_BPS,
+    DEFAULT_MAX_DISTANCE_TICKS,
+    DEFAULT_MAX_ORDER_QTY,
+    DEFAULT_ORDER_ENTRY_LATENCY_US,
+    DEFAULT_POST_ONLY_GAP_TICKS,
+    DEFAULT_QUEUE_MODE,
+    DEFAULT_TRADE_AT_LEVEL_WEIGHT,
+    DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY,
+)
 from mmrt.cli.execution_env_config import ExecutionEnvConfigBuildInput, build_execution_env_config_from_input
 from mmrt.cli.evaluate_execution_policy import (
     _adverse_queue_config_compatibility,
@@ -46,24 +62,24 @@ SAMPLE_POLICIES = (
 )
 
 _ENV_DEFAULTS = {
-    "cancel_guard_ticks": 2,
+    "cancel_guard_ticks": DEFAULT_CANCEL_GUARD_TICKS,
     "max_episode_steps": None,
-    "max_distance_ticks": 1,
-    "max_order_qty": 0.001,
-    "post_only_gap_ticks": 1,
-    "default_order_qty": 0.001,
-    "queue_mode": QueueModelMode.BALANCED,
-    "l2_decrease_weight": 0.25,
-    "trade_at_level_weight": 0.5,
-    "unknown_level_queue_ahead_qty": 1_000_000_000.0,
-    "dedupe_l2_decrease_with_trade_prints": True,
-    "maker_fee_bps": -0.5,
+    "max_distance_ticks": DEFAULT_MAX_DISTANCE_TICKS,
+    "max_order_qty": DEFAULT_MAX_ORDER_QTY,
+    "post_only_gap_ticks": DEFAULT_POST_ONLY_GAP_TICKS,
+    "default_order_qty": DEFAULT_DEFAULT_ORDER_QTY,
+    "queue_mode": DEFAULT_QUEUE_MODE,
+    "l2_decrease_weight": DEFAULT_L2_DECREASE_WEIGHT,
+    "trade_at_level_weight": DEFAULT_TRADE_AT_LEVEL_WEIGHT,
+    "unknown_level_queue_ahead_qty": DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY,
+    "dedupe_l2_decrease_with_trade_prints": DEFAULT_DEDUPE_L2_DECREASE_WITH_TRADE_PRINTS,
+    "maker_fee_bps": DEFAULT_MAKER_FEE_BPS,
     "edge_min_executable_edge_bps": 0.0,
     "edge_latency_buffer_bps": 0.0,
     "edge_inventory_skew_bps_per_unit": 0.0,
-    "decision_compute_latency_us": 50,
-    "order_entry_latency_us": 500,
-    "cancel_latency_us": 500,
+    "decision_compute_latency_us": DEFAULT_DECISION_COMPUTE_LATENCY_US,
+    "order_entry_latency_us": DEFAULT_ORDER_ENTRY_LATENCY_US,
+    "cancel_latency_us": DEFAULT_CANCEL_LATENCY_US,
     "inventory_penalty_bps": 0.0,
     "turnover_penalty_bps": 0.0,
     "cancel_penalty": 0.0,

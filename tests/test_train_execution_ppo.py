@@ -14,7 +14,23 @@ from mmrt.cli.train_execution_ppo import (
     _debug_start_rows,
     _summary_config,
 )
+from mmrt.cli.execution_defaults import (
+    DEFAULT_CANCEL_GUARD_TICKS,
+    DEFAULT_CANCEL_LATENCY_US,
+    DEFAULT_DECISION_COMPUTE_LATENCY_US,
+    DEFAULT_DEFAULT_ORDER_QTY,
+    DEFAULT_L2_DECREASE_WEIGHT,
+    DEFAULT_MAKER_FEE_BPS,
+    DEFAULT_MAX_DISTANCE_TICKS,
+    DEFAULT_MAX_ORDER_QTY,
+    DEFAULT_ORDER_ENTRY_LATENCY_US,
+    DEFAULT_POST_ONLY_GAP_TICKS,
+    DEFAULT_QTY_EPSILON,
+    DEFAULT_TRADE_AT_LEVEL_WEIGHT,
+    DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY,
+)
 from mmrt.execution.adverse_signal import ADVERSE_SELECTION_SIGNALS_SCHEMA, AdverseSelectionSignalArtifact
+from mmrt.execution.contracts import QueueModelMode
 from mmrt.execution.split_contract import DecisionSplitRange
 from mmrt.rl.reward_modes import TRAINING_REWARD_MODES
 from mmrt.rl.rollout import TrainWindowSampler
@@ -26,7 +42,6 @@ REQUIRED_TRAIN_ARGS = [
     "--decision-grid", "/tmp/tape/decision_grid",
     "--split-source-dataset-root", "/tmp/split-source",
     "--train-split", "train",
-    "--maker-fee-bps", "0.0",
 ]
 
 
@@ -47,6 +62,54 @@ def test_parser_dedupe_l2_trade_default_enabled():
     assert config.dedupe_l2_decrease_with_trade_prints is True
     assert config.train_window_sampling == "stratified_random"
     assert config.training_reward_mode == "equity_delta"
+
+
+def test_parser_default_env_config_is_colocated_balanced():
+    parser = build_arg_parser()
+    config = _config_from_args(parser.parse_args(REQUIRED_TRAIN_ARGS))
+    env_config = _build_env_config(config)
+    summary = _summary_config(config)
+    queue = env_config.fill_simulator_config.queue_model
+
+    assert config.cancel_guard_ticks == DEFAULT_CANCEL_GUARD_TICKS
+    assert config.max_distance_ticks == DEFAULT_MAX_DISTANCE_TICKS
+    assert config.max_order_qty == DEFAULT_MAX_ORDER_QTY
+    assert config.default_order_qty == DEFAULT_DEFAULT_ORDER_QTY
+    assert config.post_only_gap_ticks == DEFAULT_POST_ONLY_GAP_TICKS
+    assert config.queue_mode == QueueModelMode.BALANCED
+    assert config.l2_decrease_weight == DEFAULT_L2_DECREASE_WEIGHT
+    assert config.trade_at_level_weight == DEFAULT_TRADE_AT_LEVEL_WEIGHT
+    assert config.unknown_level_queue_ahead_qty == DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY
+    assert config.maker_fee_bps == DEFAULT_MAKER_FEE_BPS
+    assert config.decision_compute_latency_us == DEFAULT_DECISION_COMPUTE_LATENCY_US
+    assert config.order_entry_latency_us == DEFAULT_ORDER_ENTRY_LATENCY_US
+    assert config.cancel_latency_us == DEFAULT_CANCEL_LATENCY_US
+    assert env_config.cancel_guard_ticks == DEFAULT_CANCEL_GUARD_TICKS
+    assert env_config.action_spec.max_distance_ticks == DEFAULT_MAX_DISTANCE_TICKS
+    assert env_config.action_spec.max_order_qty == DEFAULT_MAX_ORDER_QTY
+    assert env_config.quote_geometry_config.default_order_qty == DEFAULT_DEFAULT_ORDER_QTY
+    assert env_config.quote_geometry_config.post_only_gap_ticks == DEFAULT_POST_ONLY_GAP_TICKS
+    assert queue.mode == QueueModelMode.BALANCED
+    assert queue.l2_decrease_weight == DEFAULT_L2_DECREASE_WEIGHT
+    assert queue.trade_at_level_weight == DEFAULT_TRADE_AT_LEVEL_WEIGHT
+    assert queue.unknown_level_queue_ahead_qty == DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY
+    assert queue.qty_epsilon == DEFAULT_QTY_EPSILON
+    for key in (
+        "cancel_guard_ticks",
+        "max_distance_ticks",
+        "max_order_qty",
+        "default_order_qty",
+        "post_only_gap_ticks",
+        "l2_decrease_weight",
+        "trade_at_level_weight",
+        "unknown_level_queue_ahead_qty",
+        "maker_fee_bps",
+        "decision_compute_latency_us",
+        "order_entry_latency_us",
+        "cancel_latency_us",
+    ):
+        assert summary[key] == getattr(config, key)
+    assert summary["queue_mode"] == "balanced"
 
 
 def test_parser_accepts_train_window_sampling_mode():
@@ -206,6 +269,7 @@ def test_step_discount_warning_for_event_driven_schedule():
         decision_grid_path="/tmp/tape/decision_grid",
         split_source_dataset_root="/tmp/split-source",
         discount_mode="step",
+        maker_fee_bps=0.0,
     )
 
     warnings = _config_warnings(
@@ -246,24 +310,44 @@ def test_adverse_runtime_config_inherits_post_only_gap_from_ppo_config():
     assert env_config.adverse_runtime_config.executable_edge.maker_fee_bps == env_config.fill_simulator_config.maker_fee_bps
 
 
-def _adverse_label_config(queue_mode: str, *, qty_epsilon: float = 1e-12) -> dict[str, object]:
+def _adverse_label_config(
+    queue_mode: str,
+    *,
+    qty_epsilon: float = DEFAULT_QTY_EPSILON,
+    old_defaults: bool = False,
+) -> dict[str, object]:
+    if old_defaults:
+        l2_decrease_weight = 0.25
+        trade_at_level_weight = 0.5
+        unknown_level_queue_ahead_qty = 1_000_000_000.0
+        order_entry_latency_us = 500
+    else:
+        l2_decrease_weight = DEFAULT_L2_DECREASE_WEIGHT
+        trade_at_level_weight = DEFAULT_TRADE_AT_LEVEL_WEIGHT
+        unknown_level_queue_ahead_qty = DEFAULT_UNKNOWN_LEVEL_QUEUE_AHEAD_QTY
+        order_entry_latency_us = DEFAULT_ORDER_ENTRY_LATENCY_US
     return {
         "queue_mode": queue_mode,
-        "l2_decrease_weight": 0.25,
-        "trade_at_level_weight": 0.5,
+        "l2_decrease_weight": l2_decrease_weight,
+        "trade_at_level_weight": trade_at_level_weight,
         "dedupe_l2_decrease_with_trade_prints": True,
-        "unknown_level_queue_ahead_qty": 1_000_000_000.0,
+        "unknown_level_queue_ahead_qty": unknown_level_queue_ahead_qty,
         "qty_epsilon": qty_epsilon,
-        "order_entry_latency_us": 500,
-        "decision_compute_latency_us": 50,
-        "post_only_gap_ticks": 1,
-        "order_qty": 0.001,
+        "order_entry_latency_us": order_entry_latency_us,
+        "decision_compute_latency_us": DEFAULT_DECISION_COMPUTE_LATENCY_US,
+        "post_only_gap_ticks": DEFAULT_POST_ONLY_GAP_TICKS,
+        "order_qty": DEFAULT_DEFAULT_ORDER_QTY,
         "fill_horizon_us": 1_000_000,
         "adverse_horizon_us": 1_000_000,
     }
 
 
-def _adverse_signals(queue_mode: str, *, qty_epsilon: float = 1e-12) -> AdverseSelectionSignalArtifact:
+def _adverse_signals(
+    queue_mode: str,
+    *,
+    qty_epsilon: float = DEFAULT_QTY_EPSILON,
+    old_defaults: bool = False,
+) -> AdverseSelectionSignalArtifact:
     return AdverseSelectionSignalArtifact(
         schema=ADVERSE_SELECTION_SIGNALS_SCHEMA,
         decision_local_ts_us=np.array([100], dtype=np.int64),
@@ -271,7 +355,7 @@ def _adverse_signals(queue_mode: str, *, qty_epsilon: float = 1e-12) -> AdverseS
         decision_event_seq=np.array([0], dtype=np.int64),
         target_names=("bid_touch_filled",),
         predictions={"bid_touch_filled": np.array([0.5], dtype=np.float32)},
-        adverse_label_config=_adverse_label_config(queue_mode, qty_epsilon=qty_epsilon),
+        adverse_label_config=_adverse_label_config(queue_mode, qty_epsilon=qty_epsilon, old_defaults=old_defaults),
         **grid_lineage_fields(n_rows=1),
     )
 
@@ -287,6 +371,21 @@ def test_ppo_rejects_conservative_adverse_signals_for_balanced_env():
     with pytest.raises(ValueError, match="adverse signal queue config mismatch"):
         _adverse_queue_config_compatibility(
             _adverse_signals("conservative"),
+            env_config=env_config,
+            allow_mismatch=False,
+        )
+
+
+def test_ppo_rejects_old_balanced_adverse_signals_for_new_default_env():
+    config = ExecutionPPOTrainCLIConfig(
+        tape_root="/tmp/tape",
+        decision_grid_path="/tmp/tape/decision_grid",
+        split_source_dataset_root="/tmp/split-source",
+    )
+    env_config = _build_env_config(config)
+    with pytest.raises(ValueError, match="adverse signal queue config mismatch"):
+        _adverse_queue_config_compatibility(
+            _adverse_signals("balanced", old_defaults=True),
             env_config=env_config,
             allow_mismatch=False,
         )
@@ -334,18 +433,15 @@ def test_ppo_rejects_qty_epsilon_mismatch_unless_explicitly_allowed():
     assert "qty_epsilon" in allowed["mismatches"]
 
 
-def test_parser_requires_current_split_source_and_maker_fee():
+def test_parser_requires_current_split_source_and_uses_default_maker_fee():
     parser = build_arg_parser()
-    for missing_args in (
-        ["--tape-root", "/tmp/tape", "--decision-grid", "/tmp/tape/decision_grid", "--maker-fee-bps", "0.0"],
-        ["--tape-root", "/tmp/tape", "--decision-grid", "/tmp/tape/decision_grid", "--split-source-dataset-root", "/tmp/split"],
-    ):
-        try:
-            parser.parse_args(missing_args)
-        except SystemExit as exc:
-            assert exc.code == 2
-        else:
-            raise AssertionError("parser accepted split-free or fee-implicit training args")
+    with pytest.raises(SystemExit) as excinfo:
+        parser.parse_args(["--tape-root", "/tmp/tape", "--decision-grid", "/tmp/tape/decision_grid"])
+    assert excinfo.value.code == 2
+
+    args = parser.parse_args(REQUIRED_TRAIN_ARGS)
+    config = _config_from_args(args)
+    assert config.maker_fee_bps == DEFAULT_MAKER_FEE_BPS
 
 
 def test_train_execution_ppo_debug_start_row_stays_inside_train_split():
