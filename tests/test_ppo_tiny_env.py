@@ -493,6 +493,45 @@ def test_run_execution_ppo_training_writes_summary_and_checkpoint(tmp_path):
     assert ckpt["cli_config"]["training_reward_mode"] == "equity_delta"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_run_execution_ppo_training_cuda_writes_summary_and_checkpoint(tmp_path):
+    tape_root = _tiny_tape_root(tmp_path)
+    output_json = tmp_path / "summary_cuda.json"
+    checkpoint_path = tmp_path / "checkpoint_cuda.pt"
+    summary = run_execution_ppo_training(
+        ExecutionPPOTrainCLIConfig(
+            tape_root=str(tape_root),
+            decision_grid_path=str(tape_root / "decision_grid"),
+            split_source_dataset_root=str(tape_root / "split_source"),
+            train_split="train",
+            output_json=str(output_json),
+            checkpoint_path=str(checkpoint_path),
+            overwrite=True,
+            device="cuda",
+            num_updates=1,
+            num_envs=1,
+            rollout_steps=4,
+            update_epochs=1,
+            minibatch_size=2,
+            hidden_sizes=(8,),
+            max_episode_steps=4,
+            seed=123,
+        )
+    )
+
+    assert output_json.exists()
+    assert checkpoint_path.exists()
+    assert summary["status"] == "ok"
+    assert summary["device"]["resolved_device"].startswith("cuda")
+    assert summary["training"]["updates_completed"] == 1
+    assert summary["training"]["final"]["telemetry"]["sample_count"] == 4
+    assert summary["training"]["telemetry_aggregate"]["sample_count"] == 4
+    assert summary["training"]["final"]["reward_projection_stats"]["valid_fraction"] == pytest.approx(1.0)
+    ckpt = torch.load(checkpoint_path, map_location="cpu")
+    assert ckpt["schema"] == "mmrt_execution_ppo_checkpoint"
+    assert ckpt["updates_completed"] == 1
+
+
 def test_run_execution_ppo_profile_includes_time_discount_stats(tmp_path):
     tape_root = _tiny_tape_root(tmp_path)
     profile_json = tmp_path / "profile.json"

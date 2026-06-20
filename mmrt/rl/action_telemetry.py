@@ -97,16 +97,35 @@ def _bool_value(value: object, default: bool = False) -> bool:
     return default
 
 
+def _as_numpy_array(
+    value: object,
+    *,
+    dtype: np.dtype | type | None = None,
+    name: str = "value",
+) -> np.ndarray:
+    if value is None:
+        raise ValueError(f"{name} must not be None")
+    if isinstance(value, torch.Tensor):
+        value = value.detach().to("cpu").numpy()
+    return np.asarray(value, dtype=dtype)
+
+
+def _as_numpy_1d(
+    value: object,
+    *,
+    dtype: np.dtype | type | None = None,
+    name: str = "value",
+) -> np.ndarray:
+    return _as_numpy_array(value, dtype=dtype, name=name).reshape(-1)
+
+
 def _as_float_array(values: object, *, name: str) -> np.ndarray:
-    if isinstance(values, torch.Tensor):
-        array = values.detach().to("cpu").numpy()
-    else:
-        array = np.asarray(values)
+    array = _as_numpy_array(values, name=name)
     if array.dtype == np.dtype("O"):
         array = array.astype(np.float64)
     if not np.issubdtype(array.dtype, np.number):
         raise TypeError(f"{name} must contain numeric values")
-    return np.asarray(array, dtype=np.float64)
+    return array.astype(np.float64, copy=False)
 
 
 def _as_2d_float_array(values: object, *, width: int, name: str) -> np.ndarray:
@@ -561,7 +580,7 @@ class ActionTelemetryAccumulator:
         rewards: object,
         valid_mask: object | None = None,
     ) -> None:
-        modes = np.asarray(effective_mode_ids, dtype=np.int64).reshape(-1)
+        modes = _as_numpy_1d(effective_mode_ids, dtype=np.int64, name="effective_mode_ids")
         adv = _flatten_finite(advantages, name="advantages")
         ret = _flatten_finite(returns, name="returns")
         val = _flatten_finite(values, name="values")
@@ -569,7 +588,7 @@ class ActionTelemetryAccumulator:
         if not (modes.size == adv.size == ret.size == val.size == rew.size):
             raise ValueError("training telemetry arrays must have the same flattened size")
         if valid_mask is not None:
-            mask = np.asarray(valid_mask, dtype=np.bool_).reshape(-1)
+            mask = _as_numpy_1d(valid_mask, dtype=np.bool_, name="valid_mask")
             if mask.size != modes.size:
                 raise ValueError("valid_mask must have the same flattened size")
             modes = modes[mask]
