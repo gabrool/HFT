@@ -1,6 +1,8 @@
 import json
 
 import numpy as np
+import pytest
+import torch
 
 from mmrt.execution.contracts import (
     ExecutionStepResult,
@@ -199,3 +201,78 @@ def test_training_by_effective_quote_mode_advantage_stats():
     assert training[BID_ONLY]["advantage_mean"] == 3.0
     assert training[TWO_SIDED]["reward_mean"] == -0.1
     json.dumps(training)
+
+
+def test_training_by_effective_quote_mode_cpu_tensor_valid_mask_filters_rows():
+    acc = ActionTelemetryAccumulator()
+    acc.update_training_by_effective_quote_mode(
+        torch.tensor([0, 1, 1, 3], dtype=torch.int64),
+        advantages=torch.tensor([1.0, 2.0, 4.0, -1.0]),
+        returns=torch.tensor([1.5, 2.5, 4.5, -0.5]),
+        values=torch.tensor([0.5, 0.5, 0.5, 0.5]),
+        rewards=torch.tensor([0.1, 0.2, 0.4, -0.1]),
+        valid_mask=torch.tensor([True, False, True, False]),
+    )
+
+    training = acc.as_dict()["training_by_effective_quote_mode"]
+    assert training[NO_QUOTE]["count"] == 1
+    assert training[BID_ONLY]["count"] == 1
+    assert training[BID_ONLY]["advantage_mean"] == 4.0
+    assert training[BID_ONLY]["reward_mean"] == pytest.approx(0.4)
+    assert training[TWO_SIDED]["count"] == 0
+    assert training[TWO_SIDED]["reward_mean"] is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+def test_training_by_effective_quote_mode_cuda_tensor_valid_mask_filters_rows():
+    device = torch.device("cuda:0")
+    acc = ActionTelemetryAccumulator()
+    acc.update_training_by_effective_quote_mode(
+        torch.tensor([0, 1, 1, 3], dtype=torch.int64, device=device),
+        advantages=torch.tensor([1.0, 2.0, 4.0, -1.0], device=device),
+        returns=torch.tensor([1.5, 2.5, 4.5, -0.5], device=device),
+        values=torch.tensor([0.5, 0.5, 0.5, 0.5], device=device),
+        rewards=torch.tensor([0.1, 0.2, 0.4, -0.1], device=device),
+        valid_mask=torch.tensor([True, False, True, False], device=device),
+    )
+
+    training = acc.as_dict()["training_by_effective_quote_mode"]
+    assert training[NO_QUOTE]["count"] == 1
+    assert training[BID_ONLY]["count"] == 1
+    assert training[BID_ONLY]["advantage_mean"] == 4.0
+    assert training[BID_ONLY]["reward_mean"] == pytest.approx(0.4)
+    assert training[TWO_SIDED]["count"] == 0
+    assert training[TWO_SIDED]["reward_mean"] is None
+
+
+def test_training_by_effective_quote_mode_numpy_valid_mask_filters_rows():
+    acc = ActionTelemetryAccumulator()
+    acc.update_training_by_effective_quote_mode(
+        np.array([0, 1, 1, 3], dtype=np.int64),
+        advantages=np.array([1.0, 2.0, 4.0, -1.0], dtype=np.float32),
+        returns=np.array([1.5, 2.5, 4.5, -0.5], dtype=np.float32),
+        values=np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32),
+        rewards=np.array([0.1, 0.2, 0.4, -0.1], dtype=np.float32),
+        valid_mask=np.array([True, False, True, False], dtype=np.bool_),
+    )
+
+    training = acc.as_dict()["training_by_effective_quote_mode"]
+    assert training[NO_QUOTE]["count"] == 1
+    assert training[BID_ONLY]["count"] == 1
+    assert training[BID_ONLY]["advantage_mean"] == 4.0
+    assert training[BID_ONLY]["reward_mean"] == pytest.approx(0.4)
+    assert training[TWO_SIDED]["count"] == 0
+    assert training[TWO_SIDED]["reward_mean"] is None
+
+
+def test_training_by_effective_quote_mode_rejects_wrong_size_valid_mask():
+    acc = ActionTelemetryAccumulator()
+    with pytest.raises(ValueError, match="valid_mask must have the same flattened size"):
+        acc.update_training_by_effective_quote_mode(
+            np.array([0, 1, 1, 3], dtype=np.int64),
+            advantages=np.array([1.0, 2.0, 4.0, -1.0], dtype=np.float32),
+            returns=np.array([1.5, 2.5, 4.5, -0.5], dtype=np.float32),
+            values=np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32),
+            rewards=np.array([0.1, 0.2, 0.4, -0.1], dtype=np.float32),
+            valid_mask=np.array([True, False, True], dtype=np.bool_),
+        )
